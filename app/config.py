@@ -3,11 +3,10 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Google / Gmail
-    google_cloud_project_id: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
-    gmail_pubsub_topic: str = ""
     gmail_user_email: str = ""
+    gmail_poll_interval_seconds: int = 60
 
     # Anthropic
     anthropic_api_key: str = ""

@@ -15,26 +15,22 @@ RECEIPT_KEYWORDS = [
 ]
 
 
-def decode_pubsub_notification(data: dict) -> dict | None:
-    """Decode a Pub/Sub push notification and return the parsed data."""
-    message = data.get("message", {})
-    raw_data = message.get("data", "")
-
-    if not raw_data:
-        return None
-
-    import json
-    decoded = base64.urlsafe_b64decode(raw_data + "==").decode("utf-8")
-    return json.loads(decoded)
-
-
-def get_new_message_ids(history_id: str) -> list[str]:
-    """Get new message IDs since the given historyId."""
+def get_new_message_ids() -> list[str]:
+    """Poll Gmail for new messages since last check using history API."""
     service = get_gmail_service()
     stored_history = get_state(settings.database_path, "last_history_id")
 
     if not stored_history:
-        stored_history = history_id
+        # First run: get current historyId and recent messages
+        profile = service.users().getProfile(userId="me").execute()
+        history_id = str(profile["historyId"])
+        set_state(settings.database_path, "last_history_id", history_id)
+
+        # Fetch last 10 messages to process on first run
+        results = service.users().messages().list(
+            userId="me", maxResults=10, labelIds=["INBOX"]
+        ).execute()
+        return [m["id"] for m in results.get("messages", [])]
 
     try:
         results = service.users().history().list(
@@ -44,20 +40,20 @@ def get_new_message_ids(history_id: str) -> list[str]:
         ).execute()
     except Exception as e:
         if "404" in str(e) or "historyId" in str(e).lower():
-            logger.warning("History ID expired, using provided ID: %s", history_id)
-            set_state(settings.database_path, "last_history_id", history_id)
+            logger.warning("History ID expired, resetting")
+            profile = service.users().getProfile(userId="me").execute()
+            set_state(settings.database_path, "last_history_id", str(profile["historyId"]))
             return []
         raise
 
     # Update stored history ID
-    new_history_id = results.get("historyId", history_id)
+    new_history_id = results.get("historyId", stored_history)
     set_state(settings.database_path, "last_history_id", new_history_id)
 
     message_ids = []
     for record in results.get("history", []):
         for msg in record.get("messagesAdded", []):
             msg_id = msg["message"]["id"]
-            # Skip messages in DRAFT or SENT
             labels = msg["message"].get("labelIds", [])
             if "DRAFT" not in labels and "SENT" not in labels:
                 message_ids.append(msg_id)
