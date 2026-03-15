@@ -5,13 +5,13 @@ Polls a Gmail inbox for receipt/payment emails, uses Claude AI to extract struct
 
 ## Architecture
 ```
-Gmail (polled every 60s) → Keyword filter → Claude AI extract → Xero draft bill
+Gmail (polled every 60s via IMAP) → Keyword filter → Claude AI extract → Xero draft bill
 ```
 All state stored in SQLite (`data/app.db`).
 
 ## Tech Stack
 - **Python 3.12**, **FastAPI**, **uvicorn**
-- **google-api-python-client** for Gmail API
+- **imaplib** (stdlib) for Gmail via IMAP + App Password
 - **httpx** for Xero API (raw REST)
 - **anthropic** SDK for Claude AI extraction
 - **SQLite** for dedup, tokens, app state
@@ -21,14 +21,14 @@ All state stored in SQLite (`data/app.db`).
 - `app/main.py` — FastAPI app, all routes, Gmail polling loop, email processing
 - `app/config.py` — Pydantic settings from `.env`
 - `app/db/database.py` — SQLite init, CRUD helpers
-- `app/gmail/client.py` — Gmail OAuth flow, service builder
-- `app/gmail/parser.py` — Email fetching via history API, keyword filter, MIME parsing
+- `app/gmail/client.py` — Gmail IMAP connection, fetch new emails, MIME parsing
 - `app/ai/extractor.py` — Claude Sonnet receipt extraction (email → structured JSON)
 - `app/xero/auth.py` — Xero OAuth 2.0 flow, token refresh
 - `app/xero/client.py` — Create contacts, create draft ACCPAY invoices
 
 ## Key Design Decisions
-- **Polling** instead of Pub/Sub — simpler, no Google Cloud setup needed
+- **IMAP + App Password** instead of Gmail API OAuth — much simpler setup
+- **Polling** every 60s — no Pub/Sub or webhook needed
 - Bills created as **DRAFT** — user reviews in Xero before approving
 - **Keyword pre-filter** runs before AI to save Claude API costs
 - **Dedup** via `gmail_message_id` in `processed_emails` table
@@ -43,11 +43,11 @@ uvicorn app.main:app --reload
 
 ## Deployment (Zeabur)
 - Uses `Dockerfile`; mount persistent volume at `/app/data/` for SQLite
-- After deploy: visit `/xero/login` then `/gmail/login` to authorize
-- Polling starts automatically after Gmail is authorized
+- Set env vars in Zeabur dashboard
+- After deploy: visit `/xero/login` to authorize Xero
+- Gmail polling starts automatically (uses App Password, no OAuth needed)
 
 ## Routes
 - `GET /health` — healthcheck
 - `GET /status` — last 20 processed emails
 - `GET /xero/login` → `/xero/callback` — Xero OAuth
-- `GET /gmail/login` → `/gmail/callback` — Gmail OAuth

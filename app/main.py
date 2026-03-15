@@ -13,8 +13,7 @@ from app.db.database import (
     is_email_processed,
     record_email,
 )
-from app.gmail import client as gmail_client
-from app.gmail.parser import get_email_content, get_new_message_ids
+from app.gmail.client import get_new_emails
 from app.xero import auth as xero_auth
 from app.xero.client import create_bill
 
@@ -24,113 +23,83 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+RECEIPT_KEYWORDS = [
+    "receipt", "invoice", "payment", "order", "charge", "transaction",
+    "purchase", "billing", "subscription", "renewal", "paid", "confirmed",
+    "total", "amount due", "payment received", "order confirmation",
+]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db(settings.database_path)
     logger.info("App started. Database ready.")
-
-    # Start Gmail polling loop
     task = asyncio.create_task(_poll_gmail_loop())
     yield
     task.cancel()
 
 
 async def _poll_gmail_loop():
-    """Periodically poll Gmail for new emails and process receipts."""
-    # Wait a bit on startup to let things settle
     await asyncio.sleep(5)
-
     while True:
         try:
             await _poll_and_process()
         except Exception:
             logger.exception("Error during Gmail poll cycle")
-
         await asyncio.sleep(settings.gmail_poll_interval_seconds)
 
 
 async def _poll_and_process():
-    """Single poll cycle: fetch new messages and process them."""
-    try:
-        message_ids = get_new_message_ids()
-    except ValueError as e:
-        logger.warning("Gmail not ready: %s", e)
+    if not settings.gmail_app_password:
         return
 
-    for msg_id in message_ids:
+    emails = get_new_emails()
+
+    for email_data in emails:
+        msg_id = email_data["message_id"]
         if is_email_processed(settings.database_path, msg_id):
             continue
-        await _process_single_email(msg_id)
+        await _process_single_email(email_data)
 
 
-async def _process_single_email(message_id: str):
-    """Process a single email: fetch → filter → AI extract → create Xero bill."""
+async def _process_single_email(email_data: dict):
+    msg_id = email_data["message_id"]
+    subject = email_data["subject"]
+    sender = email_data["sender"]
+    body = email_data["body"]
+
     try:
-        email = get_email_content(message_id)
-        if not email:
-            record_email(
-                settings.database_path,
-                message_id,
-                subject="(filtered out)",
-                sender="",
-                status="skipped",
-            )
+        # Keyword pre-filter
+        combined = f"{subject} {sender} {body}".lower()
+        if not any(kw in combined for kw in RECEIPT_KEYWORDS):
+            logger.info("Skipping non-receipt email: %s", subject)
+            record_email(settings.database_path, msg_id, subject, sender, status="skipped")
             return
 
         # AI extraction
-        receipt_data = await extract_receipt(
-            subject=email["subject"],
-            sender=email["sender"],
-            body=email["body"],
-        )
+        receipt_data = await extract_receipt(subject=subject, sender=sender, body=body)
 
         if not receipt_data:
-            record_email(
-                settings.database_path,
-                message_id,
-                subject=email["subject"],
-                sender=email["sender"],
-                status="not_receipt",
-            )
+            record_email(settings.database_path, msg_id, subject, sender, status="not_receipt")
             return
 
         # Create Xero bill
         invoice_id = await create_bill(receipt_data)
-
-        record_email(
-            settings.database_path,
-            message_id,
-            subject=email["subject"],
-            sender=email["sender"],
-            status="success",
-            xero_invoice_id=invoice_id,
-        )
-        logger.info("Processed receipt: %s → Xero bill %s", email["subject"], invoice_id)
+        record_email(settings.database_path, msg_id, subject, sender, status="success", xero_invoice_id=invoice_id)
+        logger.info("Processed receipt: %s → Xero bill %s", subject, invoice_id)
 
     except Exception as e:
-        logger.exception("Failed to process email %s", message_id)
-        record_email(
-            settings.database_path,
-            message_id,
-            subject="(error)",
-            sender="",
-            status="error",
-            error_message=str(e)[:500],
-        )
+        logger.exception("Failed to process email %s", msg_id)
+        record_email(settings.database_path, msg_id, subject, sender, status="error", error_message=str(e)[:500])
 
 
 app = FastAPI(title="Xero Receipts Manager", lifespan=lifespan)
 
 
-# ── Health ───────────────────────────────────────────────────────────────────
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "xero-receipts-manager"}
 
-
-# ── Status ───────────────────────────────────────────────────────────────────
 
 @app.get("/status")
 async def status():
@@ -153,20 +122,3 @@ async def xero_callback(code: str):
     except Exception as e:
         logger.exception("Xero OAuth callback failed")
         return HTMLResponse(f"<h2>Xero auth failed</h2><p>{e}</p>", status_code=500)
-
-
-# ── Gmail OAuth ──────────────────────────────────────────────────────────────
-
-@app.get("/gmail/login")
-async def gmail_login():
-    return RedirectResponse(gmail_client.get_login_url())
-
-
-@app.get("/gmail/callback")
-async def gmail_callback(code: str):
-    try:
-        await gmail_client.exchange_code(code)
-        return HTMLResponse("<h2>Gmail connected successfully!</h2><p>You can close this tab.</p>")
-    except Exception as e:
-        logger.exception("Gmail OAuth callback failed")
-        return HTMLResponse(f"<h2>Gmail auth failed</h2><p>{e}</p>", status_code=500)

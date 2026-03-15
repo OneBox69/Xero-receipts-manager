@@ -2,10 +2,9 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Google / Gmail
-    google_client_id: str = ""
-    google_client_secret: str = ""
+    # Gmail (IMAP)
     gmail_user_email: str = ""
+    gmail_app_password: str = ""
     gmail_poll_interval_seconds: int = 60
 
     # Anthropic

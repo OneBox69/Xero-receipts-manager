@@ -1,79 +1,146 @@
+import email
+import imaplib
 import logging
-from urllib.parse import urlencode
-
-import httpx
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
+from email.header import decode_header
 
 from app.config import settings
-from app.db.database import get_token, save_token
+from app.db.database import get_state, set_state
 
 logger = logging.getLogger(__name__)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.modify",
-]
 
-GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-
-
-def get_login_url() -> str:
-    params = {
-        "client_id": settings.google_client_id,
-        "redirect_uri": f"{settings.app_base_url}/gmail/callback",
-        "response_type": "code",
-        "scope": " ".join(SCOPES),
-        "access_type": "offline",
-        "prompt": "consent",
-    }
-    return f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+def _connect() -> imaplib.IMAP4_SSL:
+    """Connect to Gmail via IMAP."""
+    mail = imaplib.IMAP4_SSL("imap.gmail.com")
+    mail.login(settings.gmail_user_email, settings.gmail_app_password)
+    return mail
 
 
-async def exchange_code(code: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            GOOGLE_TOKEN_URL,
-            data={
-                "code": code,
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
-                "redirect_uri": f"{settings.app_base_url}/gmail/callback",
-                "grant_type": "authorization_code",
-            },
-        )
-        resp.raise_for_status()
-        token_data = resp.json()
+def get_new_emails() -> list[dict]:
+    """Fetch unprocessed emails from Gmail inbox."""
+    mail = _connect()
+    mail.select("INBOX")
 
-    save_token(settings.database_path, "gmail", token_data)
-    logger.info("Gmail OAuth tokens stored")
-    return token_data
+    # Get the last seen UID
+    last_uid = get_state(settings.database_path, "last_email_uid")
+
+    if last_uid:
+        # Search for emails newer than last seen UID
+        status, data = mail.uid("search", None, f"UID {int(last_uid) + 1}:*")
+    else:
+        # First run: get last 10 emails
+        status, data = mail.search(None, "ALL")
+        if status == "OK" and data[0]:
+            all_ids = data[0].split()
+            recent_ids = all_ids[-10:]  # Last 10
+            data = [b" ".join(recent_ids)]
+
+    if status != "OK" or not data[0]:
+        mail.logout()
+        return []
+
+    email_ids = data[0].split()
+    emails = []
+
+    for eid in email_ids:
+        try:
+            if last_uid:
+                status, msg_data = mail.uid("fetch", eid, "(RFC822)")
+                uid = eid.decode()
+            else:
+                status, msg_data = mail.fetch(eid, "(RFC822 UID)")
+                # Extract UID from response
+                uid_line = msg_data[0][0].decode() if msg_data[0][0] else ""
+                uid = _extract_uid(uid_line) or eid.decode()
+
+            if status != "OK":
+                continue
+
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+
+            subject = _decode_header(msg.get("Subject", ""))
+            sender = _decode_header(msg.get("From", ""))
+            body = _get_body(msg)
+
+            emails.append({
+                "message_id": uid,
+                "subject": subject,
+                "sender": sender,
+                "body": body,
+            })
+        except Exception:
+            logger.exception("Failed to fetch email %s", eid)
+
+    # Update last seen UID
+    if emails:
+        # Get the highest UID
+        mail.select("INBOX")
+        status, data = mail.uid("search", None, "ALL")
+        if status == "OK" and data[0]:
+            highest_uid = data[0].split()[-1].decode()
+            set_state(settings.database_path, "last_email_uid", highest_uid)
+
+    mail.logout()
+    logger.info("Fetched %d new emails", len(emails))
+    return emails
 
 
-def get_gmail_service():
-    token_data = get_token(settings.database_path, "gmail")
-    if not token_data:
-        raise ValueError("Gmail not authenticated. Visit /gmail/login first.")
+def _extract_uid(response_line: str) -> str | None:
+    """Extract UID from IMAP fetch response."""
+    import re
+    match = re.search(r"UID (\d+)", response_line)
+    return match.group(1) if match else None
 
-    creds = Credentials(
-        token=token_data.get("access_token"),
-        refresh_token=token_data.get("refresh_token"),
-        token_uri=GOOGLE_TOKEN_URL,
-        client_id=settings.google_client_id,
-        client_secret=settings.google_client_secret,
-        scopes=SCOPES,
-    )
 
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        # Save refreshed token
-        new_token_data = {
-            "access_token": creds.token,
-            "refresh_token": creds.refresh_token,
-            "token_uri": creds.token_uri,
-        }
-        save_token(settings.database_path, "gmail", new_token_data)
+def _decode_header(value: str) -> str:
+    """Decode email header value."""
+    if not value:
+        return ""
+    parts = decode_header(value)
+    decoded = []
+    for part, charset in parts:
+        if isinstance(part, bytes):
+            decoded.append(part.decode(charset or "utf-8", errors="replace"))
+        else:
+            decoded.append(part)
+    return " ".join(decoded)
 
-    return build("gmail", "v1", credentials=creds)
+
+def _get_body(msg: email.message.Message) -> str:
+    """Extract plain text body from email message."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            if content_type == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    return payload.decode(charset, errors="replace")
+        # Fallback to HTML
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    html = payload.decode(charset, errors="replace")
+                    return _strip_html(html)
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="replace")
+            if msg.get_content_type() == "text/html":
+                return _strip_html(text)
+            return text
+    return ""
+
+
+def _strip_html(html: str) -> str:
+    """Basic HTML tag stripping."""
+    import re
+    text = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
