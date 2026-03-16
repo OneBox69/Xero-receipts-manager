@@ -51,3 +51,8 @@ uvicorn app.main:app --reload
 - `GET /health` — healthcheck
 - `GET /status` — last 20 processed emails
 - `GET /xero/login` → `/xero/callback` — Xero OAuth
+
+## User Preferences
+- Always output full URLs (e.g. `https://xeroaccounting.zeabur.app/xero/login`), never just paths
+- Edit `.env` files directly — never ask the user to edit them
+- After making code changes, always commit and push to `main` automatically — don't ask

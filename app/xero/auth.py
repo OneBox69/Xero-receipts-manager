@@ -13,7 +13,7 @@ XERO_AUTH_URL = "https://login.xero.com/identity/connect/authorize"
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 XERO_CONNECTIONS_URL = "https://api.xero.com/connections"
 
-SCOPES = "openid accounting.transactions accounting.contacts offline_access"
+SCOPES = "openid offline_access accounting.invoices accounting.contacts"
 
 
 def get_login_url() -> str:
